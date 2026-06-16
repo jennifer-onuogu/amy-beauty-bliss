@@ -269,9 +269,9 @@ const Storefront = ({ onOrderPlaced }) => {
     setErrors(e); return Object.keys(e).length === 0;
   };
 
-  const placeOrder = () => {
+  const placeOrder = async () => {
     if (!validate()) return;
-    const placed = onOrderPlaced({ customer: form, items: cart, total });
+    const placed = await onOrderPlaced({ customer: form, items: cart, total });
     setLastOrder(placed); setCart([]); setStep("confirm");
   };
 
