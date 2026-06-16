@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { supabase } from "./supabase.js";
 
 // ─── CATEGORIES ───────────────────────────────────────────────────────────────
 const CATEGORIES = ["Soap", "Scrub", "Face Care", "Body Cream", "Oil", "Body Wash", "Lip Care"];
@@ -56,8 +57,35 @@ const saveProducts = (p) => {
   sessionStorage.setItem("abb_ver", PRODUCT_VERSION);
   window.dispatchEvent(new Event("products-update"));
 };
-const getOrders = () => { try { return JSON.parse(sessionStorage.getItem("abb_orders") || "[]"); } catch { return []; } };
-const saveOrders = (o) => { sessionStorage.setItem("abb_orders", JSON.stringify(o)); window.dispatchEvent(new Event("orders-update")); };
+// ─── SUPABASE ORDER HELPERS ───────────────────────────────────────────────────
+const fetchOrders = async () => {
+  const { data, error } = await supabase
+    .from("orders")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (error) { console.error("fetchOrders:", error); return []; }
+  return data || [];
+};
+
+const insertOrder = async (order) => {
+  const { error } = await supabase.from("orders").insert([{
+    id: order.id,
+    customer: order.customer,
+    items: order.items,
+    total: order.total,
+    status: order.status,
+    created_at: order.createdAt,
+  }]);
+  if (error) console.error("insertOrder:", error);
+};
+
+const updateOrderStatus = async (id, status) => {
+  const { error } = await supabase
+    .from("orders")
+    .update({ status, updated_at: new Date().toISOString() })
+    .eq("id", id);
+  if (error) console.error("updateOrderStatus:", error);
+};
 
 // ─── DESIGN TOKENS ────────────────────────────────────────────────────────────
 // Deep plum-black + liquid gold + blush rose — bold, editorial, luxe
@@ -204,7 +232,6 @@ const Logo = ({ size = "md" }) => {
 // ─── STOREFRONT ───────────────────────────────────────────────────────────────
 const Storefront = ({ onOrderPlaced }) => {
   const [products, setProducts] = useState(getProducts);
-  const [orders, setOrders] = useState(getOrders);
   const [cart, setCart] = useState([]);
   const [step, setStep] = useState("shop");
   const [activeCategory, setActiveCategory] = useState("All");
@@ -217,10 +244,9 @@ const Storefront = ({ onOrderPlaced }) => {
   const [hoveredProduct, setHoveredProduct] = useState(null);
 
   useEffect(() => {
-    const sync = () => { setProducts(getProducts()); setOrders(getOrders()); };
+    const sync = () => setProducts(getProducts());
     window.addEventListener("products-update", sync);
-    window.addEventListener("orders-update", sync);
-    return () => { window.removeEventListener("products-update", sync); window.removeEventListener("orders-update", sync); };
+    return () => window.removeEventListener("products-update", sync);
   }, []);
 
   const addToCart = (p) => {
@@ -249,9 +275,15 @@ const Storefront = ({ onOrderPlaced }) => {
     setLastOrder(placed); setCart([]); setStep("confirm");
   };
 
-  const handleTrack = () => {
-    const found = orders.find(o => o.id === trackId.trim().toUpperCase());
-    setTrackResult(found || "notfound");
+  const handleTrack = async () => {
+    const tid = trackId.trim().toUpperCase();
+    const { data, error } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("id", tid)
+      .single();
+    if (error || !data) { setTrackResult("notfound"); }
+    else { setTrackResult(data); }
   };
 
   const categories = ["All", ...CATEGORIES.filter(c => products.some(p => p.category === c))];
@@ -643,7 +675,7 @@ const ProductModal = ({ product, onSave, onClose, onDelete }) => {
 };
 
 // ─── ADMIN DASHBOARD ──────────────────────────────────────────────────────────
-const AdminDashboard = ({ orders: initOrders, onUpdateStatus }) => {
+const AdminDashboard = ({ orders: initOrders, onUpdateStatus, loading = false }) => {
   const [adminTab, setAdminTab] = useState("orders");
   const [filter, setFilter] = useState("All");
   const [search, setSearch] = useState("");
@@ -757,7 +789,11 @@ const AdminDashboard = ({ orders: initOrders, onUpdateStatus }) => {
                 </div>
                 <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search by ID, name, or email…"
                   className="field-input" style={{ marginBottom: 14 }} />
-                {filtered.length === 0 ? (
+                {loading ? (
+                  <div style={{ background: G.deep, borderRadius: 16, padding: 40, textAlign: "center", color: G.muted, border: `1px solid ${G.border}` }}>
+                    <p style={{ fontSize: 36, marginBottom: 10 }}>⏳</p><p>Loading orders from database...</p>
+                  </div>
+                ) : filtered.length === 0 ? (
                   <div style={{ background: G.deep, borderRadius: 16, padding: 40, textAlign: "center", color: G.muted, border: `1px solid ${G.border}` }}>
                     <p style={{ fontSize: 36, marginBottom: 10 }}>📭</p><p>No orders found.</p>
                   </div>
@@ -903,9 +939,11 @@ const AdminProductCard = ({ product: p, onEdit }) => (
 
 // ─── APP ROOT ─────────────────────────────────────────────────────────────────
 export default function App() {
-  const [orders, setOrders] = useState(getOrders);
+  const [orders, setOrders] = useState([]);
   const [view, setView] = useState("shop");
+  const [loadingOrders, setLoadingOrders] = useState(true);
 
+  // Route by hash
   useEffect(() => {
     const check = () => setView(window.location.hash === "#admin" ? "admin" : "shop");
     check();
@@ -913,28 +951,47 @@ export default function App() {
     return () => window.removeEventListener("hashchange", check);
   }, []);
 
+  // Load orders from Supabase + real-time subscription
   useEffect(() => {
-    const sync = () => setOrders(getOrders());
-    window.addEventListener("orders-update", sync);
-    return () => window.removeEventListener("orders-update", sync);
+    fetchOrders().then(data => { setOrders(data); setLoadingOrders(false); });
+
+    // Real-time: any insert or update refreshes the list instantly
+    const channel = supabase
+      .channel("orders-realtime")
+      .on("postgres_changes", { event: "*", schema: "public", table: "orders" }, () => {
+        fetchOrders().then(setOrders);
+      })
+      .subscribe();
+
+    return () => supabase.removeChannel(channel);
   }, []);
 
-  const handleOrderPlaced = (orderData) => {
-    const newOrder = { ...orderData, id: uid(), createdAt: new Date().toISOString(), status: "Pending" };
-    saveOrders([newOrder, ...orders]);
+  const handleOrderPlaced = async (orderData) => {
+    const newOrder = {
+      ...orderData,
+      id: uid(),
+      createdAt: new Date().toISOString(),
+      status: "Pending",
+    };
+    await insertOrder(newOrder);
+
+    // WhatsApp notification via wa.me link opened server-side isn't possible,
+    // but we ping a simple webhook / email via Supabase edge function if set up.
+    // For now orders appear instantly in admin dashboard via real-time above.
     return newOrder;
   };
 
-  const handleUpdateStatus = (id, status) => {
-    const updated = orders.map(o => o.id === id ? { ...o, status, updatedAt: new Date().toISOString() } : o);
-    saveOrders(updated); setOrders(updated);
+  const handleUpdateStatus = async (id, status) => {
+    // Optimistic UI update
+    setOrders(prev => prev.map(o => o.id === id ? { ...o, status, updated_at: new Date().toISOString() } : o));
+    await updateOrderStatus(id, status);
   };
 
   return (
     <>
       <style>{css}</style>
       {view === "admin"
-        ? <AdminDashboard orders={orders} onUpdateStatus={handleUpdateStatus} />
+        ? <AdminDashboard orders={orders} onUpdateStatus={handleUpdateStatus} loading={loadingOrders} />
         : <Storefront onOrderPlaced={handleOrderPlaced} />}
     </>
   );
